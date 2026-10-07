@@ -7,6 +7,7 @@ import asyncio
 import hashlib
 import json
 import os
+import shutil  # [新增]
 import sys
 from datetime import datetime
 
@@ -315,6 +316,46 @@ def execute_check_in(client, account_name: str, provider_config, headers: dict):
 		return False
 
 
+# [新增] 登出：复用同一个 client（cookies）与 headers（含 new-api-user）
+def execute_logout(client, account_name: str, provider_config, headers: dict) -> bool:
+	"""签到完成后登出（尽力而为，失败不影响签到结果）"""
+	logout_path = getattr(provider_config, 'logout_path', None) or '/api/user/logout'
+	logout_url = f'{provider_config.domain}{logout_path}'
+	try:
+		# 请求方法以 DevTools 中看到的为准；new-api 系通常是 GET，若是 POST 请改为 client.post
+		response = client.get(logout_url, headers=headers, timeout=15)
+		if response.status_code == 200:
+			try:
+				ok = bool(response.json().get('success', True))
+			except Exception:
+				ok = True
+			if ok:
+				print(f'[LOGOUT] {account_name}: Logged out successfully')
+			else:
+				print(f'[WARN] {account_name}: Logout responded with success=false')
+			return ok
+		print(f'[WARN] {account_name}: Logout failed - HTTP {response.status_code}')
+	except Exception as e:
+		print(f'[WARN] {account_name}: Logout error - {str(e)[:50]}...')
+	return False
+
+
+# [新增] 清理浏览器 profile，确保下次运行必须重新走邮箱密码登录（否则会被判定为"已登录"而领不到积分）
+def clear_browser_profile(account_name: str, provider_name: str, provider_config) -> None:
+	try:
+		settings = load_browser_login_settings(
+			account_name,
+			provider_name,
+			persist_profile=provider_config.persist_profile,
+		)
+		profile_dir = getattr(settings, 'profile_dir', None)
+		if getattr(settings, 'persist_profile', False) and profile_dir and os.path.isdir(str(profile_dir)):
+			shutil.rmtree(str(profile_dir), ignore_errors=True)
+			print(f'[INFO] {account_name}: Browser profile cleared, next run will log in again')
+	except Exception as e:
+		print(f'[WARN] {account_name}: Failed to clear browser profile - {str(e)[:50]}...')
+
+
 def format_check_in_notification(detail: dict) -> str:
 	"""格式化签到通知消息"""
 	lines = [
@@ -396,14 +437,24 @@ async def check_in_account(account: AccountConfig, account_index: int, app_confi
 
 	print(f'[AUTH] {account_name}: Using auth method -> {auth_method}')
 
-	return run_check_in_requests(
+	# [修改] 仅邮箱密码模式登出：cookies 模式的会话是用户自己复制的，登出会让其失效
+	use_logout = auth_method == 'email/password'
+
+	result = run_check_in_requests(
 		all_cookies,
 		account,
 		account_name,
 		provider_config,
 		api_user_override=resolved_api_user,
 		use_proxy=provider_config.use_proxy,
+		logout_after=use_logout,  # [新增]
 	)
+
+	# [新增] 登出后清理浏览器 profile，保证下次运行是一次全新登录
+	if use_logout:
+		clear_browser_profile(account_name, account.provider, provider_config)
+
+	return result
 
 
 def run_check_in_requests(
@@ -414,6 +465,7 @@ def run_check_in_requests(
 	*,
 	api_user_override: str | None = None,
 	use_proxy: bool = False,
+	logout_after: bool = False,  # [新增]
 ) -> tuple[bool, dict | None, dict | None]:
 	"""执行 HTTP 签到请求（同步，避免在 async 上下文中使用阻塞 httpx）。"""
 	try:
@@ -448,25 +500,30 @@ def run_check_in_requests(
 			if api_user:
 				headers[provider_config.api_user_key] = api_user
 
-			user_info_url = f'{provider_config.domain}{provider_config.user_info_path}'
-			user_info_before = get_user_info(client, headers, user_info_url)
-			if user_info_before and user_info_before.get('success'):
-				print(user_info_before['display'])
-			elif user_info_before:
-				print(user_info_before.get('error', 'Unknown error'))
+			# [修改] 用 try/finally 包住原有逻辑：无论签到成功、失败还是抛异常，return 之前都会先登出
+			try:
+				user_info_url = f'{provider_config.domain}{provider_config.user_info_path}'
+				user_info_before = get_user_info(client, headers, user_info_url)
+				if user_info_before and user_info_before.get('success'):
+					print(user_info_before['display'])
+				elif user_info_before:
+					print(user_info_before.get('error', 'Unknown error'))
 
-			if provider_config.needs_manual_check_in():
-				success = execute_check_in(client, account_name, provider_config, headers)
+				if provider_config.needs_manual_check_in():
+					success = execute_check_in(client, account_name, provider_config, headers)
+					user_info_after = get_user_info(client, headers, user_info_url)
+					return success, user_info_before, user_info_after
+
 				user_info_after = get_user_info(client, headers, user_info_url)
-				return success, user_info_before, user_info_after
-
-			user_info_after = get_user_info(client, headers, user_info_url)
-			if user_info_after and user_info_after.get('success'):
-				print(f'[INFO] {account_name}: Check-in completed automatically (triggered by user info request)')
-				return True, user_info_before, user_info_after
-			error = user_info_after.get('error', 'Unknown error') if user_info_after else 'Unknown error'
-			print(f'[FAILED] {account_name}: Auto check-in failed - {error}')
-			return False, user_info_before, user_info_after
+				if user_info_after and user_info_after.get('success'):
+					print(f'[INFO] {account_name}: Check-in completed automatically (triggered by user info request)')
+					return True, user_info_before, user_info_after
+				error = user_info_after.get('error', 'Unknown error') if user_info_after else 'Unknown error'
+				print(f'[FAILED] {account_name}: Auto check-in failed - {error}')
+				return False, user_info_before, user_info_after
+			finally:
+				if logout_after:
+					execute_logout(client, account_name, provider_config, headers)
 
 	except Exception as e:
 		print(f'[FAILED] {account_name}: Error occurred during check-in process - {str(e)[:50]}...')
